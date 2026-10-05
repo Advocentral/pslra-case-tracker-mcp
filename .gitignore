@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+output/
+*.db
+*.db.lock
+dist/
+.pytest_cache/
+files.zip
+*.pdf
