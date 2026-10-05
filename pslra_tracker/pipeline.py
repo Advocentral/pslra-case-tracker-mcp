@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import date, timedelta
@@ -30,6 +31,7 @@ from .store import Store
 JEV_TRIAGE = 0.80    # confidence needed to set an announcement aside on its headline alone
 JEV_CLASSIFY = 0.60  # confidence needed to take Jev's reading of a release over the regex rule
 JEV_DOCKET = 0.70    # confidence needed to label a docket from its caption
+JEV_WORKERS = 16     # concurrent Jev requests; far below the service limit, and the wires are never hit in parallel
 HELD = "held: headline only, no deadline; waiting for its case"
 THRESHOLD = 0.85   # nothing below this is merged; in doubt a separate case is opened
 
@@ -65,17 +67,24 @@ def triage_title(it: Item, wire: bool) -> tuple[str, str] | None:
     return None
 
 
-def triage(it: Item, wire: bool, judge: Judge | None) -> tuple[str, str] | None:
-    """Headline triage. With Jev, the model's reading of the headline replaces the keyword rules whenever it
-    is confident; otherwise the keyword rules decide."""
+def prejudge(judge: Judge | None, items: list[Item]) -> None:
+    """Ask Jev about many announcements at once and keep each answer on its item. The calls are
+    independent, so they run concurrently; a failed call leaves `judged` empty and the regex rule decides."""
+    todo = [it for it in items if not it.kind]
+    if not judge or not todo:
+        return
+    with ThreadPoolExecutor(JEV_WORKERS) as pool:
+        for it, got in zip(todo, pool.map(lambda it: judge.announcement(it.title, it.text), todo)):
+            it.judged = got or ()
+
+
+def triage(it: Item, wire: bool, judged: bool) -> tuple[str, str] | None:
+    """Headline triage. With Jev, the model's reading of the headline (see `prejudge`) replaces the keyword
+    rules whenever it is confident; otherwise the keyword rules decide."""
     by_rule = triage_title(it, wire)
-    if not (judge and wire) or it.kind:
+    if not (judged and wire) or it.kind or not it.judged:
         return by_rule
-    got = judge.announcement(it.title, it.text)
-    if not got:
-        return by_rule
-    it.judged = got
-    kind, conf = got
+    kind, conf = it.judged
     if kind in ("filing", "reminder"):
         return None                       # worth reading, even where a keyword rule would have dropped it
     if conf >= JEV_TRIAGE:
@@ -83,13 +92,12 @@ def triage(it: Item, wire: bool, judge: Judge | None) -> tuple[str, str] | None:
     return by_rule
 
 
-def judged_classify(it: Item, ex: dict, judge: Judge | None) -> tuple[str, str]:
-    """Step 3, second half, with Jev when available. The regex verdict is kept alongside when they differ."""
+def judged_classify(it: Item, ex: dict, judged: bool) -> tuple[str, str]:
+    """Step 3, second half, with Jev when available (answers already gathered by `prejudge`).
+    The regex verdict is kept alongside when they differ."""
     rule_kind, rule_reason = classify(it, ex)
-    if not judge or it.kind:
-        return rule_kind, rule_reason
-    got = judge.announcement(it.title, it.text) if it.body_fetched else (it.judged or None)
-    if not got or got[1] < JEV_CLASSIFY:
+    got = it.judged
+    if not judged or it.kind or not got or got[1] < JEV_CLASSIFY:
         return rule_kind, rule_reason
     kind, conf = got
     note = f"jev: {kind} ({conf:.2f})"
@@ -261,14 +269,13 @@ def sweep_courts(store: Store, days: int, log: list[str], judge: Judge | None = 
         store.mark("courtlistener", ok=False, error=f"{type(e).__name__}: {e}")
         log.append(f"courtlistener: ERROR {e} (nothing recorded; retried next run)")
         return {"error": str(e)}
-    new = 0
-    for d in dockets:
-        d["classified_by"] = "caption rule"
-        if judge and not store.has_docket(d["docket_id"]):
-            got = judge.docket(d)
-            if got and got[1] >= JEV_DOCKET:
-                d["classification"], d["classified_by"] = got[0], f"jev ({got[1]:.2f})"
-        new += store.add_docket(d)
+    fresh = [d for d in dockets if not store.has_docket(d["docket_id"])]
+    if judge and fresh:
+        with ThreadPoolExecutor(JEV_WORKERS) as pool:
+            for d, got in zip(fresh, pool.map(judge.docket, fresh)):
+                if got and got[1] >= JEV_DOCKET:
+                    d["classification"], d["classified_by"] = got[0], f"jev ({got[1]:.2f})"
+    new = sum(store.add_docket(d) for d in dockets)
     store.mark("courtlistener", ok=True, listed=len(dockets), new=new,
                newest=max((d["date_filed"] for d in dockets), default=""))
     log.append(f"courtlistener: {len(dockets)} dockets filed since {since}, {new} new")
@@ -321,9 +328,12 @@ def run(store: Store, sources: list[str] | None = None, days: int = 14, max_fetc
             new = [it for it in uniq if not store.seen(it.link or it.title)]
             stat = {"listed": len(listed), "already_seen": len(uniq) - len(new), "new": len(new), "deferred": 0}
             fetched = 0   # the cap is per source, so one busy wire cannot starve the others
+            wire = bool(src and src.kind == "wire")
+            if wire:
+                prejudge(judge, new)          # headlines, all at once
             for it in new:
                 it.link = it.link or it.title
-                aside = triage(it, bool(src and src.kind == "wire"), judge)
+                aside = triage(it, wire, bool(judge))
                 if aside:
                     store.add_announcement(it, *aside)
                     summary["set_aside"][aside[0]] = summary["set_aside"].get(aside[0], 0) + 1
@@ -349,11 +359,12 @@ def run(store: Store, sources: list[str] | None = None, days: int = 14, max_fetc
                 summary[k] += stat[k]
             log.append(f"{name}: {stat}")
 
+        prejudge(judge, [it for it in pending if it.body_fetched])   # full releases, all at once
         pairs = [(it, facts(it)) for it in pending]
         relevant = []
         # announcements that state a deadline go first, so headline-only ones find a case to join
         for it, ex in sorted(pairs, key=lambda p: (not p[1].get("deadline"), not p[0].body_fetched)):
-            kind, reason = judged_classify(it, ex, judge)
+            kind, reason = judged_classify(it, ex, bool(judge))
             if kind not in ("filing", "reminder"):
                 store.add_announcement(it, kind, reason, ex)
                 summary["set_aside"][kind] = summary["set_aside"].get(kind, 0) + 1

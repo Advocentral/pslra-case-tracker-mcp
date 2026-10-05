@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 log = logging.getLogger(__name__)
 
@@ -58,17 +59,21 @@ class Judge:
     def __init__(self, client):
         self.client = client
         self.calls = self.errors = self.input_tokens = 0
+        self._lock = threading.Lock()   # calls are made from several threads at once
 
     def _choice(self, state: dict, instructions: str, criteria: dict) -> tuple[str, float] | None:
         try:
             from typesafe_sdk import Choice
-            self.calls += 1
             r = self.client.system_one(state, {"q": Choice(instructions=instructions, criteria=criteria)})
-            self.input_tokens += r.usage.input_tokens
+            with self._lock:
+                self.calls += 1
+                self.input_tokens += r.usage.input_tokens
             a = r.choices["q"]
             return a.choice, float(a.confidence)
         except Exception as e:  # noqa: BLE001  any failure means "fall back to the regex rule"
-            self.errors += 1
+            with self._lock:
+                self.calls += 1
+                self.errors += 1
             log.warning("Jev call failed: %s: %s", type(e).__name__, e)
             return None
 
