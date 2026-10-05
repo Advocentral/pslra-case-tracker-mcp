@@ -41,7 +41,7 @@ claude mcp add pslra-tracker -- uv run --directory /path/to/pslra-tracker pslra-
 }
 ```
 
-**Remote connector (claude.ai)**: `pslra-tracker serve --http --port 8765` serves streamable HTTP at `/mcp`. It binds to localhost and has **no authentication**; put it behind an authenticating reverse proxy before exposing it.
+**Remote connector (claude.ai and Claude Desktop "custom connector")**: see [Remote connector with sign-in](#remote-connector-with-sign-in).
 
 Then ask things like *"refresh the tracker, then which lead plaintiff deadlines fall in the next two weeks?"* or *"which securities dockets were filed this week that no firm has announced yet?"*
 
@@ -55,6 +55,23 @@ Then ask things like *"refresh the tracker, then which lead plaintiff deadlines 
 | `search_announcements` | Every announcement ever read, including those set aside, with the decision made about each. |
 | `list_court_dockets` | Federal securities dockets from CourtListener, matched or not yet matched to a case. |
 | `source_status` | Each source's last success, last error and newest item reached, plus record counts. |
+
+## Remote connector with sign-in
+
+Custom connectors are reached from Anthropic's servers, not from your computer, so the tracker needs a public **https** address and a login.
+
+```bash
+export PSLRA_AUTH_PASSWORD='a long passphrase'
+pslra-tracker serve --http --port 8765 --public-url https://tracker.example.com
+```
+
+`--public-url` is the address Claude will use. It switches on OAuth 2.1: Claude registers itself, opens a sign-in page in your browser, and you approve by typing the password. In Claude, add a custom connector with the URL `https://tracker.example.com/mcp`.
+
+- Put TLS in front (a reverse proxy, or a tunnel such as `cloudflared tunnel --url http://127.0.0.1:8765` for testing; pass the tunnel's https address as `--public-url`).
+- Access tokens last an hour and refresh automatically for 30 days. Only token hashes are stored, in the tracker's SQLite file.
+- `PSLRA_API_TOKEN` optionally sets a static bearer token for scripts (`Authorization: Bearer ...`).
+- Without `--public-url` the server only binds to localhost and has no login. It refuses to bind to any other address without sign-in.
+- One password, one operator. There are no per-user accounts; anyone with the password can read and refresh the tracker.
 
 ## Optional: Jev for classification
 
@@ -135,6 +152,9 @@ Dockets are linked to a case by the docket number a release quotes, or by compan
 | `PSLRA_USER_AGENT` | How the tracker identifies itself to sources. |
 | `COURTLISTENER_TOKEN` | Optional. Lifts CourtListener's anonymous rate limit. |
 | `TYPESAFE_API_KEY` | Optional. Turns on Jev classification. |
+| `PSLRA_AUTH_PASSWORD` | Required with `--public-url`. The sign-in password for the remote connector. |
+| `PSLRA_PUBLIC_URL` | Same as `--public-url`. |
+| `PSLRA_API_TOKEN` | Optional static bearer token for scripts, HTTP mode only. |
 | `PSLRA_JEV=0` | Keeps the key but forces regex only. |
 
 ## Project layout
@@ -147,6 +167,7 @@ pslra_tracker/
   pipeline.py   collect, skip seen, set aside, extract, match or create
   store.py      SQLite record of announcements, cases, dockets and watermarks
   server.py     MCP server
+  auth.py       OAuth sign-in for the HTTP transport
   cli.py        command line
   report.py     HTML and CSV report
 tests/          unit tests and 19 real releases used as a benchmark

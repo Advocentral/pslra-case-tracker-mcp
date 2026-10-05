@@ -5,6 +5,8 @@ Read tools answer from the local SQLite record; only `refresh_cases` touches the
 
 from __future__ import annotations
 
+import ipaddress
+import os
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
@@ -31,9 +33,25 @@ INSTRUCTIONS = (
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 
 
-def build(db: Path | None = None) -> MCPServer:
-    mcp = MCPServer("pslra-tracker", instructions=INSTRUCTIONS, version=__version__)
+def build(db: Path | None = None, public_url: str = "") -> MCPServer:
+    """`public_url` switches OAuth on: the address Claude will reach the server at."""
     store = Store(db)
+    extra = {}
+    provider = None
+    if public_url:
+        from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+
+        from .auth import SCOPE, Provider
+        provider = Provider(store.db, public_url, os.environ["PSLRA_AUTH_PASSWORD"], os.environ.get("PSLRA_API_TOKEN", ""))
+        extra = {"auth_server_provider": provider, "auth": AuthSettings(
+            issuer_url=public_url, resource_server_url=public_url.rstrip("/") + "/mcp",
+            validate_token_resource=False,   # this server issues its own tokens; none exist for another resource
+            required_scopes=[SCOPE],
+            client_registration_options=ClientRegistrationOptions(enabled=True, valid_scopes=[SCOPE],
+                                                                  default_scopes=[SCOPE]))}
+    mcp = MCPServer("pslra-tracker", instructions=INSTRUCTIONS, version=__version__, **extra)
+    if provider:
+        mcp.custom_route("/login", methods=["GET", "POST"])(provider.login)
 
     def _status(c, today: date) -> str:
         if not c.deadline:
@@ -167,9 +185,32 @@ def build(db: Path | None = None) -> MCPServer:
     return mcp
 
 
-def serve(db: Path | None = None, http: bool = False, host: str = "127.0.0.1", port: int = 8765) -> None:
-    mcp = build(db)
-    if http:
-        mcp.run(transport="streamable-http", host=host, port=port)
-    else:
-        mcp.run(transport="stdio")
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+def serve(db: Path | None = None, http: bool = False, host: str = "127.0.0.1", port: int = 8765,
+          public_url: str = "") -> None:
+    if not http:
+        build(db).run(transport="stdio")
+        return
+    public_url = public_url or os.environ.get("PSLRA_PUBLIC_URL", "")
+    if public_url and not os.environ.get("PSLRA_AUTH_PASSWORD"):
+        raise SystemExit("--public-url turns sign-in on, which needs a password: set PSLRA_AUTH_PASSWORD.")
+    if not public_url and not _is_loopback(host):
+        raise SystemExit(f"Refusing to serve on {host} without sign-in. Pass --public-url (and set "
+                         "PSLRA_AUTH_PASSWORD), or bind to 127.0.0.1.")
+    kwargs = {}
+    if public_url:
+        from urllib.parse import urlsplit
+
+        from mcp.server.transport_security import TransportSecuritySettings
+        u = urlsplit(public_url)
+        kwargs["transport_security"] = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[u.netloc, f"127.0.0.1:{port}", f"localhost:{port}"],
+            allowed_origins=[f"{u.scheme}://{u.netloc}", "https://claude.ai", "https://claude.com"])
+    build(db, public_url).run(transport="streamable-http", host=host, port=port, **kwargs)

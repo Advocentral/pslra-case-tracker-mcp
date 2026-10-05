@@ -6,7 +6,7 @@
   pslra-tracker cases --due-within 14     # print open deadlines
   pslra-tracker sources                   # source catalogue and watermarks
   pslra-tracker serve                     # MCP server over stdio (for Claude Desktop / Claude Code)
-  pslra-tracker serve --http --port 8765  # MCP server over streamable HTTP (for a remote connector)
+  pslra-tracker serve --http --public-url https://tracker.example.com   # remote connector, with sign-in
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def cmd_sources(args) -> None:
 
 def cmd_serve(args) -> None:
     from .server import serve
-    serve(db=args.db, http=args.http, host=args.host, port=args.port)
+    serve(db=args.db, http=args.http, host=args.host, port=args.port, public_url=args.public_url)
 
 
 def main() -> None:
@@ -112,6 +112,8 @@ def main() -> None:
     s.add_argument("--http", action="store_true", help="streamable HTTP instead of stdio")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--public-url", default="", help="https address Claude reaches the server at; turns on "
+                   "OAuth sign-in (password from PSLRA_AUTH_PASSWORD). Also read from PSLRA_PUBLIC_URL.")
     s.set_defaults(fn=cmd_serve)
 
     args = ap.parse_args()

@@ -200,3 +200,47 @@ def test_jev_labels_dockets_only_when_confident(store, monkeypatch):
     monkeypatch.setattr(pipeline, "fetch_dockets", lambda since: [{**d, "docket_id": 11}])
     pipeline.sweep_courts(store, 7, [], FakeJudge({}, ("securities_class_action", 0.50)))
     assert [x for x in store.dockets() if x["docket_id"] == 11][0]["classification"] == "securities_candidate"
+
+
+def test_oauth_sign_in_needs_the_password_and_codes_work_once(store):
+    import asyncio
+
+    from mcp.server.auth.provider import AuthorizationParams, TokenError
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    from pslra_tracker.auth import Provider
+
+    class Req:   # the two things the login handler reads from a request
+        def __init__(self, tx, password=None):
+            self.query_params, self.method, self._pw = {"tx": tx}, "POST" if password is not None else "GET", password
+
+        async def form(self):
+            return {"password": self._pw}
+
+    async def flow():
+        p = Provider(store.db, "https://tracker.example", "s3cret", api_token="static")
+        client = OAuthClientInformationFull(client_id="c1", client_name="Claude",
+                                            redirect_uris=["https://claude.ai/api/mcp/auth_callback"])
+        await p.register_client(client)
+        params = AuthorizationParams(state="st", scopes=["pslra"], code_challenge="x" * 43,
+                                     redirect_uri="https://claude.ai/api/mcp/auth_callback",
+                                     redirect_uri_provided_explicitly=True)
+        tx = (await p.authorize(client, params)).split("tx=")[1]
+        assert (await p.login(Req(tx, "wrong"))).status_code == 401 and not p.codes
+        ok = await p.login(Req(tx, "s3cret"))
+        assert ok.status_code == 302 and "state=st" in ok.headers["location"]
+        assert (await p.login(Req(tx, "s3cret"))).status_code == 400          # the sign-in link is spent
+        code = await p.load_authorization_code(client, next(iter(p.codes)))
+        tok = await p.exchange_authorization_code(client, code)
+        with pytest.raises(TokenError):
+            await p.exchange_authorization_code(client, code)                  # a code is good once
+        assert (await p.load_access_token(tok.access_token)).client_id == "c1"
+        assert await p.load_access_token("garbage") is None
+        assert (await p.load_access_token("static")).client_id == "static-token"
+        stored = [r[0] for r in store.db.execute("SELECT hash FROM oauth_tokens")]
+        assert tok.access_token not in stored and len(stored) == 2             # hashes only
+        old = await p.load_refresh_token(client, tok.refresh_token)
+        await p.exchange_refresh_token(client, old, ["pslra"])
+        assert await p.load_refresh_token(client, tok.refresh_token) is None   # rotated
+
+    asyncio.run(flow())
